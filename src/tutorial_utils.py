@@ -48,10 +48,13 @@ def month_axis(ax):
 
 
 def show(df, left=(), row_css=None):
+    df = df.copy()
+    df.insert(0, "#", df.index + 1 if pd.api.types.is_integer_dtype(df.index) else range(1, len(df) + 1))
     fmt = {c: "{:.1f}" for c in df.columns if pd.api.types.is_float_dtype(df[c])}
     if "timestamp" in df.columns:
         fmt["timestamp"] = lambda t: f"{t:%d %b %H:%M}"
-    styler = df.style.hide(axis="index").set_table_styles(TABLE_CSS).format(fmt)
+    styler = (df.style.hide(axis="index").set_table_styles(TABLE_CSS).format(fmt)
+              .set_table_styles({"#": [{"selector": "td", "props": f"color:{FADED}"}]}, overwrite=False))
     if left:
         styler = styler.set_table_styles({c: [{"selector": "td", "props": "text-align:left"}] for c in left}, overwrite=False)
     if row_css:
@@ -77,15 +80,22 @@ def rule_text(antecedents):
     return " AND ".join(f"{a['feature']} = {a['value']}" for a in antecedents)
 
 
+def sort_rules(rules):
+    return sorted(rules, key=lambda r: (len(r["antecedents"]), -r["support"], -r["confidence"]))
+
+
+def rule_at(rules, row):
+    return sort_rules(rules)[row - 1]
+
+
 def rules_table(rules, n=None):
+    rules = sort_rules(rules)
     df = pd.DataFrame({
         "IF": [rule_text(r["antecedents"]) for r in rules],
         "THEN": [f"{r['consequent']['feature']} = {r['consequent']['value']}" for r in rules],
         "support": [r["support"] for r in rules],
         "confidence": [r["confidence"] for r in rules],
     })
-    df["n"] = [len(r["antecedents"]) for r in rules]
-    df = df.sort_values(["n", "support", "confidence"], ascending=[True, False, False]).drop(columns="n").reset_index(drop=True)
     df = df.head(n) if n else df
     return show(df, left=["IF", "THEN"]).format({"support": "{:.0%}", "confidence": "{:.0%}"})
 
@@ -144,7 +154,7 @@ def plot_rule_explosion(possible, found):
     plt.show()
 
 
-def explain_examples(data, examples):
+def explain_examples(data, examples, highlight=None):
     rows = []
     for ant, cons, why in examples:
         ants = [{"feature": f, "value": v} for f, v in ant.items()]
@@ -154,13 +164,16 @@ def explain_examples(data, examples):
                      "Confidence": hit[m].mean(), "Base rate": hit.mean(), "Why": why})
     df = pd.DataFrame(rows)
     row_css = {i: (f"font-weight:bold; color:#000; background:#fff; border-top:2.5px solid {RED}; border-bottom:2.5px solid {RED}"
-                   if e[2].startswith("far above") else f"color:{FADED}") for i, e in enumerate(examples)}
+                   if i + 1 == highlight else f"color:{FADED}") for i in range(len(examples))}
     return (show(df, left=["Rule"], row_css=row_css)
             .format({"Support": "{:.0%}", "Confidence": "{:.0%}", "Base rate": "{:.0%}"})
             .set_table_styles({"Why": [{"selector": "td", "props": "font-style:italic"}]}, overwrite=False))
 
 
 # ---------- network ----------
+
+NODE_LABEL_RIGHT = {"11"}  # Hanoi: keeps n11 clear of the p12 label
+
 
 def _network(ax, scenario_dir, sensors, highlight=()):
     inp = next(scenario_dir.glob("*.inp"))
@@ -174,6 +187,11 @@ def _network(ax, scenario_dir, sensors, highlight=()):
             ax.plot([x1, x2], [y1, y2], color=PINK, lw=13, solid_capstyle="round", zorder=1)
         used = name in sensors
         ax.plot([x1, x2], [y1, y2], color=DARK if used else GRID, lw=3.5 if used else 1.6, zorder=2)
+        if used:
+            horizontal = abs(x2 - x1) > abs(y2 - y1)
+            ax.annotate(f"p{p}", ((x1 + x2) / 2, (y1 + y2) / 2), xytext=(0, -9) if horizontal else (9, 0),
+                        textcoords="offset points", ha="center" if horizontal else "left",
+                        va="top" if horizontal else "center", color=BROWN, fontsize=9.5, fontweight="bold", zorder=6)
 
     for n, (x, y) in xy.items():
         name = f"node_{n}_pressure"
@@ -184,7 +202,10 @@ def _network(ax, scenario_dir, sensors, highlight=()):
             ax.annotate("reservoir", (x, y), xytext=(0, -20), textcoords="offset points", ha="center", fontsize=10)
         elif name in sensors:
             ax.scatter(x, y, s=95, color=DARK, edgecolor=DARK_EDGE, zorder=4)
-            ax.annotate(n, (x, y), xytext=(-9, 7), textcoords="offset points", ha="right", fontsize=10, fontweight="bold")
+            right = n in NODE_LABEL_RIGHT
+            ax.annotate(f"n{n}", (x, y), xytext=(10, 0) if right else (-9, 7), textcoords="offset points",
+                        ha="left" if right else "right", va="center" if right else "baseline", fontsize=10,
+                        fontweight="bold")
         else:
             ax.scatter(x, y, s=28, color=GRID, zorder=4)
 
@@ -192,11 +213,11 @@ def _network(ax, scenario_dir, sensors, highlight=()):
         x, y = xy[leak["node"]]
         days = (leak["end"] - leak["start"]).total_seconds() / 86400
         duration = f"{days:.0f} days" if days >= 10 else f"{days:.1f} days"
-        ax.scatter(x, y, s=700, marker="*", color=RED, edgecolor=RED_EDGE, linewidth=1, zorder=5)
+        ax.scatter(x, y, s=420, facecolor="none", edgecolor=RED, linewidth=3, zorder=5)
         right_half = x > np.median([p[0] for p in xy.values()])
-        ax.annotate(f"leak at node {leak['node']}\n{leak['start']:%d %b} – {leak['end']:%d %b}  ({duration})",
-                    (x, y), xytext=(26, 0) if right_half else (0, -34), textcoords="offset points",
-                    ha="left" if right_half else "center", va="center" if right_half else "top",
+        ax.annotate(f"leak at junction {leak['node']}\n{leak['start']:%d %b} – {leak['end']:%d %b}  ({duration})",
+                    (x, y), xytext=(28, 4) if right_half else (0, -34), textcoords="offset points",
+                    ha="left" if right_half else "center", va="bottom" if right_half else "top",
                     fontsize=10, color="#000", linespacing=1.5,
                     bbox=dict(boxstyle="round,pad=0.5", fc="#fff", ec=RED, lw=1.5), zorder=6)
     ax.set_aspect("equal")
@@ -205,17 +226,18 @@ def _network(ax, scenario_dir, sensors, highlight=()):
 
 
 def _network_legend(fig, highlight, ax=None):
-    handles = [Line2D([], [], marker="*", ls="", ms=18, color=RED, mec=RED_EDGE, label="leak location"),
-               Line2D([], [], marker="o", ls="", ms=9, color=DARK, label="pressure sensor"),
-               Line2D([], [], color=DARK, lw=3.5, label="flow sensor (pipe)"),
-               Line2D([], [], marker="o", ms=5, color=GRID, lw=1.6, label="not used")]
+    handles = [Line2D([], [], marker="o", ls="", ms=9, color=DARK, label="n28 = pressure sensor at junction 28"),
+               Line2D([], [], color=DARK, lw=3.5, label="p29 = flow sensor in pipe 29"),
+               Line2D([], [], marker="o", ls="", ms=14, mfc="none", mec=RED, mew=2.5, label="junction with a leak"),
+               Line2D([], [], marker="o", ms=5, color=GRID, lw=1.6, label="junction / pipe without sensor"),
+               Line2D([], [], marker="s", ls="", ms=10, color=BROWN, mec=DARK_EDGE, label="reservoir (water source)")]
     if highlight:
         handles.append(Line2D([], [], marker="o", ls="", ms=16, color=PINK, label="used in a leak rule"))
-    kw = dict(handles=handles, ncol=len(handles), fontsize=10.5, handletextpad=0.6, columnspacing=2.2)
+    kw = dict(handles=handles, ncol=3, fontsize=10.5, handletextpad=0.6, columnspacing=2.0, labelspacing=0.9)
     if ax is not None:
         ax.legend(loc="upper left", bbox_to_anchor=(0, 0), **kw)
     else:
-        fig.legend(loc="lower center", bbox_to_anchor=(0.5, -0.02), **kw)
+        fig.legend(loc="lower center", bbox_to_anchor=(0.5, -0.06), **kw)
 
 
 def draw_network(scenario_dir, sensors, highlight=(), title_text="Hanoi water network (LeakDB, Scenario 10)"):
