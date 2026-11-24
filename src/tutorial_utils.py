@@ -385,3 +385,66 @@ def plot_alarms(timestamps, test_data, alarm, year_start="2017-01-01", year_end=
     title(ax, f"Test weeks:  {y[alarm].mean():.0%} of alarms are real leaks,  "
               f"{alarm[y].mean():.0%} of leak windows raise an alarm")
     plt.show()
+
+
+def animate_alarms(timestamps, test_data, rules, step="1D", interval=350):
+    from matplotlib import animation
+    from IPython.display import HTML
+
+    t = pd.to_datetime(pd.Series(timestamps).values)
+    y = test_data["leakage"].values == "yes"
+    ordered = sort_rules(rules)
+    hits = np.array([fires(r["antecedents"], test_data) for r in ordered])
+    alarm = hits.any(0)
+    x = np.arange(len(t))
+    frames = np.searchsorted(t.values, pd.Series(t.floor(step).unique()).values + pd.Timedelta(step))
+    week_starts = [0] + [i for i in range(1, len(t)) if t[i] - t[i - 1] > pd.Timedelta("1D")]
+
+    fig, ax = plt.subplots(figsize=(11, 3.3))
+    fig.subplots_adjust(top=0.78, bottom=0.3)
+    alarm_bars = ax.bar(x, np.zeros(len(t)), bottom=1.15, width=1, align="edge", color=DARK)
+    leak_bars = ax.bar(x, np.zeros(len(t)), width=1, align="edge", color=RED)
+    for w in week_starts[1:]:
+        ax.axvline(w, color=GRID, lw=0.8, ls=":")
+    cursor = ax.axvline(0, color=BROWN, lw=1.8)
+    for h in (0, 1.15):
+        ax.axhline(h, color=GRID, lw=0.8)
+    bounds = week_starts + [len(t)]
+    labelled = [w for w, nxt in zip(week_starts, bounds[1:]) if nxt - w >= 12]
+    ax.set_xticks(labelled, [f"{t[w]:%d %b}" for w in labelled], fontsize=9)
+    ax.set_xlabel("test weeks only, placed side by side", color=FADED, fontsize=10)
+    ax.set_yticks([0.375, 1.525], ["leak active", "a rule fired"])
+    ax.set_ylim(-0.1, 2.0)
+    ax.set_xlim(0, len(t))
+    ax.tick_params(axis="y", length=0)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_visible(False)
+    head = fig.text(0.125, 0.9, "", fontfamily=SERIF, fontsize=15, color="#000")
+    status = fig.text(0.125, 0.06, "", fontsize=12, color="#000")
+
+    def update(k):
+        n = frames[k]
+        for i in range(n):
+            alarm_bars[i].set_height(0.75 * alarm[i])
+            leak_bars[i].set_height(0.75 * y[i])
+        i = n - 1
+        cursor.set_xdata([n, n])
+        caught, false_alarms, missed = (alarm[:n] & y[:n]).sum(), (alarm[:n] & ~y[:n]).sum(), (~alarm[:n] & y[:n]).sum()
+        head.set_text(f"{t[i]:%d %b %H:%M}      correct alarms {caught}   ·   false alarms {false_alarms}   ·   "
+                      f"missed leak windows {missed}")
+        if alarm[i]:
+            reason = rule_text(ordered[np.argmax(hits[:, i])]["antecedents"])
+            status.set_text(("correct alarm" if y[i] else "false alarm") + f",  because  {reason}")
+            status.set_color(DARK_EDGE if y[i] else RED)
+        else:
+            status.set_text("missed leak" if y[i] else "all quiet")
+            status.set_color(RED if y[i] else FADED)
+        return [*alarm_bars, *leak_bars, cursor, head, status]
+
+    anim = animation.FuncAnimation(fig, update, frames=len(frames), interval=interval, blit=False)
+    plt.rcParams["animation.embed_limit"] = 60
+    html = anim.to_jshtml(default_mode="once")
+    assert html.count('class="anim-state">') == 1
+    html = html.replace('class="anim-state">', 'class="anim-state" style="display:none">')  # hide loop-mode buttons
+    plt.close(fig)
+    return HTML(html)
