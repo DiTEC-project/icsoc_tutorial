@@ -47,14 +47,16 @@ def month_axis(ax):
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
 
 
-def show(df, left=(), row_css=None):
+def show(df, left=(), row_css=None, numbered=True):
     df = df.copy()
-    df.insert(0, "#", df.index + 1 if pd.api.types.is_integer_dtype(df.index) else range(1, len(df) + 1))
+    if numbered:
+        df.insert(0, "#", df.index + 1 if pd.api.types.is_integer_dtype(df.index) else range(1, len(df) + 1))
     fmt = {c: "{:.1f}" for c in df.columns if pd.api.types.is_float_dtype(df[c])}
     if "timestamp" in df.columns:
         fmt["timestamp"] = lambda t: f"{t:%d %b %H:%M}"
     styler = (df.style.hide(axis="index").set_table_styles(TABLE_CSS).format(fmt)
-              .set_table_styles({"#": [{"selector": "td", "props": f"color:{FADED}"}]}, overwrite=False))
+              .set_table_styles({"#": [{"selector": "td", "props": f"color:{FADED}"}]} if "#" in df else {},
+                                overwrite=False))
     if left:
         styler = styler.set_table_styles({c: [{"selector": "td", "props": "text-align:left"}] for c in left}, overwrite=False)
     if row_css:
@@ -366,85 +368,161 @@ def plot_train_vs_test(rules, test_data):
     plt.show()
 
 
-def plot_alarms(timestamps, test_data, alarm, year_start="2017-01-01", year_end="2017-12-31"):
-    t = pd.to_datetime(timestamps).values
-    y = test_data["leakage"].values == "yes"
-    fig, ax = plt.subplots(figsize=(11, 2.4))
-    width = pd.Timedelta("6h")
-    ax.bar(t, 0.75 * alarm, bottom=1.15, width=width, align="edge", color=DARK)
-    ax.bar(t, 0.75 * y, width=width, align="edge", color=RED)
-    ax.axhline(1.15, color=GRID, lw=0.8)
-    ax.axhline(0, color=GRID, lw=0.8)
-    ax.set_yticks([0.375, 1.525], ["leak active", "a rule fired"])
-    ax.set_ylim(-0.1, 2.0)
-    ax.tick_params(axis="y", length=0)
-    for s in ("left", "bottom"):
-        ax.spines[s].set_visible(False)
-    ax.set_xlim(pd.Timestamp(year_start), pd.Timestamp(year_end))
-    month_axis(ax)
-    title(ax, f"Test weeks:  {y[alarm].mean():.0%} of alarms are real leaks,  "
-              f"{alarm[y].mean():.0%} of leak windows raise an alarm")
-    plt.show()
+ALARM_HTML = r"""
+<div id="ta-__UID__" style="position:relative; width:960px; font-family:'Liberation Sans',Arial,sans-serif; color:#3B3836">
+  <div class="ta-head" style="font-family:'Liberation Serif','Times New Roman',serif; font-size:19px; color:#000; margin:4px 0 10px; white-space:pre"></div>
+  <div style="display:flex; align-items:center; gap:12px; margin-bottom:6px">
+    <button class="ta-play" style="width:84px; padding:5px 0; font-size:14px; border:1.5px solid #5E5A57; border-radius:6px; background:#F4EEEA; cursor:pointer">&#9654; play</button>
+    <input class="ta-slider" type="range" min="0" value="0" style="flex:1; accent-color:#9C7B5C">
+    <select class="ta-speed" style="font-size:13px; padding:3px">
+      <option value="300">slow</option><option value="120" selected>normal</option><option value="40">fast</option>
+    </select>
+  </div>
+  <svg class="ta-svg" width="960" height="175" shape-rendering="crispEdges"></svg>
+  <div class="ta-status" style="font-size:15px; font-weight:bold; margin:2px 0 0 110px; min-height:22px; white-space:pre"></div>
+  <div style="font-size:13px; color:#6C6A68; margin:4px 0 0 110px">Click a dark alarm bar to see every rule that raised it.</div>
+  <div class="ta-pop" style="display:none; position:absolute; left:110px; top:60px; width:760px; max-height:330px; overflow-y:auto;
+       background:#fff; border:2px solid #000; border-radius:8px; box-shadow:0 6px 20px rgba(0,0,0,.25); padding:14px 18px; z-index:10"></div>
+</div>
+<script>
+(function () {
+  var D = __DATA__;
+  var root = document.getElementById("ta-__UID__");
+  var svg = root.querySelector(".ta-svg"), head = root.querySelector(".ta-head"), status = root.querySelector(".ta-status");
+  var pop = root.querySelector(".ta-pop"), slider = root.querySelector(".ta-slider"), play = root.querySelector(".ta-play");
+  var speed = root.querySelector(".ta-speed");
+  var C = {dark: "#5E5A57", red: "#BE503E", grid: "#C2B2AB", brown: "#9C7B5C", faded: "#6C6A68"};
+  var NS = "http://www.w3.org/2000/svg", n = D.windows.length, L = 110, PW = 960 - L - 20, bw = PW / n;
+  function el(tag, attrs, parent) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    (parent || svg).appendChild(e);
+    return e;
+  }
+  function txt(x, y, s, attrs) { var t = el("text", Object.assign({x: x, y: y, "font-size": 13, fill: "#3B3836"}, attrs || {})); t.textContent = s; return t; }
+  function num(v) { return v.toLocaleString("en-US", {minimumFractionDigits: 1, maximumFractionDigits: 1}); }
+  function pct(v) { return Math.round(v * 100) + "%"; }
+
+  txt(L - 10, 45, "a rule fired", {"text-anchor": "end"});
+  txt(L - 10, 110, "leak active", {"text-anchor": "end"});
+  el("line", {x1: L, x2: L + PW, y1: 70, y2: 70, stroke: C.grid});
+  el("line", {x1: L, x2: L + PW, y1: 135, y2: 135, stroke: C.grid});
+  D.weeks.forEach(function (w) {
+    if (w[0] > 0) el("line", {x1: L + w[0] * bw, x2: L + w[0] * bw, y1: 15, y2: 135, stroke: C.grid, "stroke-dasharray": "2,3"});
+    if (w[1]) txt(L + w[0] * bw, 152, w[1], {"font-size": 11, "text-anchor": "middle"});
+  });
+  txt(L + PW / 2, 170, "test weeks only, placed side by side", {"font-size": 12, fill: C.faded, "text-anchor": "middle"});
+  var alarmBars = [], leakBars = [], targets = [];
+  D.windows.forEach(function (w, i) {
+    var a = el("rect", {x: L + i * bw, y: 20, width: bw + 0.6, height: 48, fill: C.dark, visibility: "hidden", cursor: "pointer"});
+    var hit = el("rect", {x: L + (i + 0.5) * bw - Math.max(bw, 8) / 2, y: 16, width: Math.max(bw, 8), height: 56,
+                          fill: "transparent", visibility: "hidden", cursor: "pointer"});
+    if (w.fired.length) {
+      el("title", {}, hit).textContent = w.t + ", " + w.fired.length + " rule" + (w.fired.length > 1 ? "s" : "") + " fired, click for details";
+      hit.addEventListener("click", function () { open(i); });
+    }
+    alarmBars.push(a); targets.push(hit);
+    leakBars.push(el("rect", {x: L + i * bw, y: 85, width: bw + 0.6, height: 48, fill: C.red, visibility: "hidden"}));
+  });
+  var cursor = el("line", {x1: L, x2: L, y1: 12, y2: 137, stroke: C.brown, "stroke-width": 2});
+
+  function verdict(w) {
+    if (w.fired.length) return w.leak ? ["correct alarm: a leak is active", "#3B3836"] : ["false alarm: no leak", C.red];
+    return w.leak ? ["missed leak", C.red] : ["all quiet", C.faded];
+  }
+  function render(pos) {
+    pos = Math.max(0, Math.min(pos, n));
+    var ok = 0, bad = 0, miss = 0;
+    for (var i = 0; i < n; i++) {
+      var w = D.windows[i], shown = i < pos;
+      alarmBars[i].setAttribute("visibility", shown && w.fired.length ? "visible" : "hidden");
+      targets[i].setAttribute("visibility", shown && w.fired.length ? "visible" : "hidden");
+      leakBars[i].setAttribute("visibility", shown && w.leak ? "visible" : "hidden");
+      if (shown) { if (w.fired.length && w.leak) ok++; else if (w.fired.length) bad++; else if (w.leak) miss++; }
+    }
+    var x = L + pos * bw;
+    cursor.setAttribute("x1", x); cursor.setAttribute("x2", x);
+    var cur = D.windows[Math.max(pos - 1, 0)];
+    head.textContent = (pos ? cur.t : "start") + "      correct alarms " + ok + "  ·  false alarms " + bad + "  ·  missed leak windows " + miss;
+    var v = pos ? verdict(cur) : ["", ""];
+    status.textContent = pos ? cur.t.slice(-5) + "   " + v[0] + (cur.fired.length ? "  (" + cur.fired.length + " rule" + (cur.fired.length > 1 ? "s" : "") + " fired)" : "") : "";
+    status.style.color = v[1];
+    slider.value = pos;
+  }
+  function open(i) {
+    var w = D.windows[i], v = verdict(w), h = [];
+    h.push('<div style="display:flex; justify-content:space-between; align-items:baseline">' +
+           '<div style="font-size:16px; font-weight:bold; color:' + v[1] + '">' + w.t + ' &nbsp; ' + v[0] + '</div>' +
+           '<span class="ta-close" style="cursor:pointer; font-size:22px; color:#3B3836">&times;</span></div>');
+    h.push('<div style="font-size:13px; color:' + C.faded + '; margin:2px 0 10px">' + w.fired.length +
+           ' rule' + (w.fired.length > 1 ? 's' : '') + ' fired. Support and confidence are measured on the weeks the rules were learned from.</div>');
+    w.fired.forEach(function (r, k) {
+      var R = D.rules[r];
+      h.push('<div style="padding:8px 0; border-top:1px solid ' + C.grid + '">');
+      h.push('<div style="font-size:14px; color:#000"><b>' + (k + 1) + '. IF</b> ' + R.if + ' <b>THEN</b> leakage = yes</div>');
+      h.push('<div style="font-size:13px; margin:3px 0 4px 18px">support <b>' + pct(R.s) + '</b> &nbsp;·&nbsp; confidence <b>' + pct(R.c) + '</b></div>');
+      R.conds.forEach(function (c) {
+        h.push('<div style="font-size:13px; color:#3B3836; margin-left:18px">' + c[0] + ' reads <b>' + num(D.read[c[0]][i]) + ' ' + c[2] +
+               '</b>, inside ‘' + c[1] + '’ (' + num(c[3]) + ' – ' + num(c[4]) + ' ' + c[2] + ')</div>');
+      });
+      h.push('</div>');
+    });
+    pop.innerHTML = h.join("");
+    pop.style.display = "block";
+    pop.querySelector(".ta-close").addEventListener("click", function () { pop.style.display = "none"; });
+  }
+  var pos = 0, timer = null;
+  function stop() { clearInterval(timer); timer = null; play.innerHTML = "&#9654; play"; }
+  function start() {
+    if (pos >= n) pos = 0;
+    play.innerHTML = "&#10074;&#10074; pause";
+    timer = setInterval(function () { pos++; render(pos); if (pos >= n) stop(); }, +speed.value);
+  }
+  play.addEventListener("click", function () { timer ? stop() : start(); });
+  speed.addEventListener("change", function () { if (timer) { stop(); start(); } });
+  slider.max = n;
+  slider.addEventListener("input", function () { pos = +slider.value; render(pos); });
+  render(0);
+  root.taOpen = open; root.taRender = function (p) { pos = Math.min(p, n); render(pos); };
+})();
+</script>
+"""
 
 
-def animate_alarms(timestamps, test_data, rules, step="1D", interval=350):
-    from matplotlib import animation
+def animate_alarms(table, data, test, rules):
+    import json
+    import uuid
     from IPython.display import HTML
 
-    t = pd.to_datetime(pd.Series(timestamps).values)
-    y = test_data["leakage"].values == "yes"
+    t = pd.to_datetime(table["timestamp"][test].values)
+    raw = table[test].reset_index(drop=True)
+    test_data = data[test].reset_index(drop=True)
+    leak = test_data["leakage"].values == "yes"
+    ranges = category_ranges(table)
     ordered = sort_rules(rules)
     hits = np.array([fires(r["antecedents"], test_data) for r in ordered])
-    alarm = hits.any(0)
-    x = np.arange(len(t))
-    frames = np.searchsorted(t.values, pd.Series(t.floor(step).unique()).values + pd.Timedelta(step))
     week_starts = [0] + [i for i in range(1, len(t)) if t[i] - t[i - 1] > pd.Timedelta("1D")]
-
-    fig, ax = plt.subplots(figsize=(11, 3.3))
-    fig.subplots_adjust(top=0.78, bottom=0.3)
-    alarm_bars = ax.bar(x, np.zeros(len(t)), bottom=1.15, width=1, align="edge", color=DARK)
-    leak_bars = ax.bar(x, np.zeros(len(t)), width=1, align="edge", color=RED)
-    for w in week_starts[1:]:
-        ax.axvline(w, color=GRID, lw=0.8, ls=":")
-    cursor = ax.axvline(0, color=BROWN, lw=1.8)
-    for h in (0, 1.15):
-        ax.axhline(h, color=GRID, lw=0.8)
     bounds = week_starts + [len(t)]
-    labelled = [w for w, nxt in zip(week_starts, bounds[1:]) if nxt - w >= 12]
-    ax.set_xticks(labelled, [f"{t[w]:%d %b}" for w in labelled], fontsize=9)
-    ax.set_xlabel("test weeks only, placed side by side", color=FADED, fontsize=10)
-    ax.set_yticks([0.375, 1.525], ["leak active", "a rule fired"])
-    ax.set_ylim(-0.1, 2.0)
-    ax.set_xlim(0, len(t))
-    ax.tick_params(axis="y", length=0)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_visible(False)
-    head = fig.text(0.125, 0.9, "", fontfamily=SERIF, fontsize=15, color="#000")
-    status = fig.text(0.125, 0.06, "", fontsize=12, color="#000")
-
-    def update(k):
-        n = frames[k]
-        for i in range(n):
-            alarm_bars[i].set_height(0.75 * alarm[i])
-            leak_bars[i].set_height(0.75 * y[i])
-        i = n - 1
-        cursor.set_xdata([n, n])
-        caught, false_alarms, missed = (alarm[:n] & y[:n]).sum(), (alarm[:n] & ~y[:n]).sum(), (~alarm[:n] & y[:n]).sum()
-        head.set_text(f"{t[i]:%d %b %H:%M}      correct alarms {caught}   ·   false alarms {false_alarms}   ·   "
-                      f"missed leak windows {missed}")
-        if alarm[i]:
-            reason = rule_text(ordered[np.argmax(hits[:, i])]["antecedents"])
-            status.set_text(("correct alarm" if y[i] else "false alarm") + f",  because  {reason}")
-            status.set_color(DARK_EDGE if y[i] else RED)
-        else:
-            status.set_text("missed leak" if y[i] else "all quiet")
-            status.set_color(RED if y[i] else FADED)
-        return [*alarm_bars, *leak_bars, cursor, head, status]
-
-    anim = animation.FuncAnimation(fig, update, frames=len(frames), interval=interval, blit=False)
-    plt.rcParams["animation.embed_limit"] = 60
-    html = anim.to_jshtml(default_mode="once")
-    assert html.count('class="anim-state">') == 1
-    html = html.replace('class="anim-state">', 'class="anim-state" style="display:none">')  # hide loop-mode buttons
-    plt.close(fig)
+    payload = {
+        "windows": [{"t": f"{t[i]:%d %b %H:%M}", "leak": bool(leak[i]), "fired": np.flatnonzero(hits[:, i]).tolist()}
+                    for i in range(len(t))],
+        "weeks": [[w, f"{t[w]:%d %b}" if nxt - w >= 12 else ""] for w, nxt in zip(week_starts, bounds[1:])],
+        "rules": [{"if": rule_text(r["antecedents"]), "s": r["support"], "c": r["confidence"],
+                   "conds": [[a["feature"], a["value"], UNITS[a["feature"].rsplit("_", 1)[1]],
+                              *ranges[a["feature"]][a["value"]]] for a in r["antecedents"]]} for r in ordered],
+        "read": {f: raw[f].round(1).tolist() for f in rule_sensors(ordered)},
+    }
+    html = ALARM_HTML.replace("__UID__", uuid.uuid4().hex[:8]).replace("__DATA__", json.dumps(payload))
     return HTML(html)
+
+
+# ---------- checking alarms ----------
+
+def category_ranges(table, n_bins=3):
+    ranges = {}
+    for c in table.columns:
+        if c in ("timestamp", "leakage"):
+            continue
+        _, edges = pd.cut(table[c], n_bins, retbins=True)
+        ranges[c] = {label: (edges[k], edges[k + 1]) for k, label in enumerate(["low", "mid", "high"])}
+    return ranges
